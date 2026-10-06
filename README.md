@@ -109,7 +109,9 @@ SSE 响应:
 - **无水印换链**：SSE 返回的生图直链是 `h1_`（带"元宝 AI生成"水印）版；会话详情接口里每张图另带 `originUrl`（`h0_` 原始无水印版）。生图端点完成后自动按路径匹配替换为 `originUrl` 返回（实测 h0 3786KB vs h1 3527KB，确为两个文件）。总开关 `YUANBAO_WATERMARK_FREE=off`。图生图另有模型侧去水印：模型扩写 prompt 时会主动加"去除水印"指令。
 - **工具调用是提示词注入式模拟**：元宝协议不透传 `tools`，服务把工具定义注入 prompt 并解析模型输出的 `<<TOOL_CALL>>` 标记转换为 OpenAI `tool_calls` 格式（流式请求带 tools 时自动切换为缓冲模式）。可靠性依赖模型遵循指令（Hy4 实测稳定）。服务级总开关 `YUANBAO_TOOLS=off`；请求级开关天然存在（不带 tools 数组即不启用）。
 - **异步生图任务表是内存态**：服务重启即清空，未做持久化。
-- **搜索模式是 prompt 指令强制 + 引用收集**：`-search` 后缀模型在 prompt 前置联网指令，SSE 的 `searchGuid.docs`（title/url/quote）被收集为"参考链接"附在回答末尾。不保证每次都触发搜索（意图模型仍有裁量权）。
+- **搜索模式已升级为协议级**：`-search` 后缀走"深度研究"技能（`applicationIdList: ["application_id_deep_research"]`，浏览器抓包实证），prompt 指令作双保险并压制 agent 反问。引用来自 SSE `searchGuid.docs`（title/url）。
+- **元宝技能应用族**（`applicationIdList` 可用值，源码全量枚举）：`deep_research`（深度研究）、`web_search`、`knowledge_search`、`ai_coding`、`ai_reading`、`ai_answering`、`ai_writing`、`ai_image`、`ppt_generation`、`data_analysis`、`investment_analysis`、`professional_writing`、`personal_plan`、`teaching_assistant`、`voice_recorder`、`working_agent`。`web_search` 单独实测不触发搜索（UI 已砍手动开关、全走智能联网），`deep_research` 实测有效。
+- **搜索控制状态机**（源码逆向，模块 27889）：`supportFunctions` 含 `openInternetSearch`→强开 / `closeInternetSearch`→强关 / `autoInternetSearch`→智能；`chatModelExtInfo.internetSearch` 同值域。纯协议下仅改这些值不生效，需配合 applicationIdList。
 - **生图比例走 prompt 指令**：`size` 参数映射为"画幅比例 X:Y"追加到 prompt（元宝生图无原生比例参数），实测 16:9 → 2048x1152 精确生效。
 - **凭据过期识别**：上游错误码 20001/23000 会被转成 HTTP 401 + `code: yuanbao_token_expired`，提示运行登录器。
 - **token 寿命**：实测持续有效中（具体寿命待观察）；401 即重跑登录器。

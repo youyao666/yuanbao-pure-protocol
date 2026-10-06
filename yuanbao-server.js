@@ -77,7 +77,7 @@ async function createConversation() {
   return cid;
 }
 
-async function yuanbaoChat(cid, prompt, chatModelId, plugin, multimedia) {
+async function yuanbaoChat(cid, prompt, chatModelId, plugin, multimedia, applicationIdList) {
   const body = {
     model: 'gpt_175B_0404', prompt, plugin,
     displayPrompt: prompt, displayPromptType: 1,
@@ -91,7 +91,7 @@ async function yuanbaoChat(cid, prompt, chatModelId, plugin, multimedia) {
       modelId: chatModelId, agentModeModelSetting: { modelId: chatModelId },
       supportFunctions: { internetSearch: '' }, internetSearch: 'autoInternetSearch',
     }),
-    applicationIdList: [], version: 'v2', extReportParams: null, isAtomInput: false,
+    applicationIdList: applicationIdList || [], version: 'v2', extReportParams: null, isAtomInput: false,
     conversationId: cid, offsetOfHour: 8, offsetOfMinute: 0,
   };
   const res = await fetch(`${BASE}/api/chat/${cid}`, {
@@ -277,14 +277,16 @@ async function handleChat(req, res, body) {
   const model = resolveModel(body.model);
   const hasTools = TOOLS_ENABLED && Array.isArray(body.tools) && body.tools.length > 0;
   let prompt = messagesToPrompt(body.messages || []);
-  if (model.search) prompt = '请联网搜索相关资料后回答：\n' + prompt;
+  if (model.search) prompt = '请联网搜索相关资料，直接给出完整答案，不要向用户提问确认：\n' + prompt;
   if (hasTools) prompt = buildToolDirective(body.tools) + '\n\n' + prompt;
   const stream = body.stream === true;
   const id = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
   const created = Math.floor(Date.now() / 1000);
 
   const cid = await createConversation();
-  const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, '', []);
+  // 搜索模式走深度研究技能（协议级 applicationIdList，浏览器抓包实证），保留 prompt 指令作双保险
+  const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, '', [],
+    model.search ? ['application_id_deep_research'] : undefined);
 
   if (!stream) {
     const { text, think, usage, citations } = await readSse(upstream);
