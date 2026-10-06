@@ -65,6 +65,7 @@ node yuanbao-probe.js --image2img 输入图.png "把这张图里的猫变成素�
 node yuanbao-server.js                          # 默认 http://127.0.0.1:8788/v1
 #   可选环境变量: YUANBAO_PORT=8788  YUANBAO_API_KEY=sk-xxx(开启后校验 Bearer)
 #                YUANBAO_TOOLS=off  (关闭工具调用模拟)
+#                YUANBAO_WATERMARK_FREE=off  (关闭无水印换链，默认返回无水印原图)
 #   端点: GET  /v1/models
 #         POST /v1/chat/completions（流式/非流式；支持 tools/tool_calls 工具调用）
 #         POST /v1/images/generations（文生图，同步）
@@ -102,6 +103,7 @@ SSE 响应:
 
 - **网页改版后签名失效**：表现为 create 返回 400/401 或"服务繁忙"。此时需重新 dump `qimei-modules.json`：用浏览器打开元宝 → 控制台执行 `webpackChunk_N_E.push([[tag],{},q=>window.__wr=q])` 钩出模块表 → 导出 `__wr.m` 全量源码合并为 `{modules:{id:source}}` JSON。入口模块 ID 会漂移（当前为 77004，历史上有 12601 等），可扫描含 `getUSKeySync` 字符串的模块定位。
 - **控制台噪音**：SDK 初始化时会向 console 打印环境探测对象（无害），关键输出均带 `[probe]`/`[login]` 前缀，可 grep 过滤。
+- **无水印换链**：SSE 返回的生图直链是 `h1_`（带"元宝 AI生成"水印）版；会话详情接口里每张图另带 `originUrl`（`h0_` 原始无水印版）。生图端点完成后自动按路径匹配替换为 `originUrl` 返回（实测 h0 3786KB vs h1 3527KB，确为两个文件）。总开关 `YUANBAO_WATERMARK_FREE=off`。图生图另有模型侧去水印：模型扩写 prompt 时会主动加"去除水印"指令。
 - **工具调用是提示词注入式模拟**：元宝协议不透传 `tools`，服务把工具定义注入 prompt 并解析模型输出的 `<<TOOL_CALL>>` 标记转换为 OpenAI `tool_calls` 格式（流式请求带 tools 时自动切换为缓冲模式）。可靠性依赖模型遵循指令（Hy4 实测稳定）。服务级总开关 `YUANBAO_TOOLS=off`；请求级开关天然存在（不带 tools 数组即不启用）。
 - **异步生图任务表是内存态**：服务重启即清空，未做持久化。
 - **token 寿命**：实测持续有效中（具体寿命待观察）；401 即重跑登录器。

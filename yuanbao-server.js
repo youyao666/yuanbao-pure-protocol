@@ -12,6 +12,8 @@ const PORT = process.env.YUANBAO_PORT || 8788;
 const API_KEY = process.env.YUANBAO_API_KEY || '';
 // 工具调用总开关：YUANBAO_TOOLS=off 关闭（提示词注入式模拟，关闭后请求带 tools 也会被忽略）
 const TOOLS_ENABLED = !/^off|0|false|no$/i.test(process.env.YUANBAO_TOOLS || '');
+// 无水印开关：YUANBAO_WATERMARK_FREE=off 关闭（生图后从会话详情换 originUrl(h0) 原始版）
+const WM_FREE_ENABLED = !/^off|0|false|no$/i.test(process.env.YUANBAO_WATERMARK_FREE || '');
 const BASE = 'https://yuanbao.tencent.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
@@ -335,6 +337,30 @@ async function handleChat(req, res, body) {
   finishStream('stop', usage);
 }
 
+// 无水印换链：SSE 返回的 text2img 直链为 h1（带水印）版，会话详情里每张图带
+// originUrl（h0 原始版）。生图完成后按路径匹配替换。失败时原样返回。
+async function enrichWatermarkFree(cid, urls) {
+  if (!WM_FREE_ENABLED || !urls.length) return urls;
+  try {
+    const res = await fetch(`${BASE}/api/user/agent/conversation/v1/detail`, {
+      method: 'POST', headers: baseHeaders(),
+      body: JSON.stringify({ conversationId: cid, agentId: cookie.agentId }),
+    });
+    const j = await res.json();
+    const map = new Map();
+    const walk = o => {
+      if (o && typeof o === 'object') {
+        if (o.originUrl && o.url) map.set(o.url.split('?')[0], o.originUrl);
+        for (const v of Object.values(o)) walk(v);
+      }
+    };
+    walk(j);
+    return urls.map(u => map.get(u.split('?')[0]) || u);
+  } catch {
+    return urls;
+  }
+}
+
 async function handleImageGen(req, res, body) {
   let prompt = body.prompt || '';
   if (!prompt) return json(res, 400, { error: { message: 'prompt required' } });
@@ -344,8 +370,9 @@ async function handleImageGen(req, res, body) {
   const cid = await createConversation();
   const upstream = await yuanbaoChat(cid, prompt, 'hunyuan_omnipotent_hy4', 'Adaptive', []);
   const { images } = await readSse(upstream);
-  const n = Math.max(1, Math.min(body.n || 4, images.length));
-  let data = images.slice(0, n);
+  const urls = await enrichWatermarkFree(cid, images);
+  const n = Math.max(1, Math.min(body.n || 4, urls.length));
+  let data = urls.slice(0, n);
   if (b64) {
     data = await Promise.all(data.map(async u => {
       const r = await fetch(u);
@@ -380,12 +407,13 @@ async function handleImageGenAsync(req, res, body) {
       const upstream = await yuanbaoChat(cid, prompt, 'hunyuan_omnipotent_hy4', 'Adaptive', []);
       const { images } = await readSse(upstream);
       if (!images.length) throw new Error('未生成任何图片（意图未路由到生图，可尝试加绘画动词）');
+      const urls = await enrichWatermarkFree(cid, images);
       task.data = b64
-        ? await Promise.all(images.map(async u => {
+        ? await Promise.all(urls.map(async u => {
             const r = await fetch(u);
             return { b64_json: Buffer.from(await r.arrayBuffer()).toString('base64') };
           }))
-        : images.map(u => ({ url: u }));
+        : urls.map(u => ({ url: u }));
       task.status = 'succeeded';
     } catch (e) {
       task.error = e.message;
@@ -414,7 +442,8 @@ async function handleImageEdit(req, res, fields, files) {
   // 注意：带图时 plugin 必须为空串（'Adaptive' 会走图片理解分支，实测只出文字不出图）
   const upstream = await yuanbaoChat(cid, prompt, 'hunyuan_omnipotent_hy4', '', [mm]);
   const { images } = await readSse(upstream);
-  let data = images.length ? images : [];
+  const urls = await enrichWatermarkFree(cid, images);
+  let data = urls;
   if (b64 && data.length) {
     data = await Promise.all(data.map(async u => {
       const r = await fetch(u);
