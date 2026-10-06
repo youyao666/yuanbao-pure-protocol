@@ -76,6 +76,7 @@ node yuanbao-server.js                          # 默认 http://127.0.0.1:8788/v
 #               或 OpenAI 风格 1792x1024 等）
 #         POST /v1/images/async + GET /v1/images/async/{id}（异步生图：提交即返回、轮询取图）
 #         POST /v1/files/chat（multipart：file + prompt，文档上传→解析→问答一条龙）
+#         POST /v1/vision（multipart：image + prompt，图片理解→文字描述）
 #         POST /v1/images/edits（图生图，标准 multipart） | GET /healthz
 #   模型: 任一模型名加 -search 后缀 = 强制联网搜索模式（回答末尾附参考链接），
 #         如 hy4-search / deepseek-search
