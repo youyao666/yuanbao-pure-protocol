@@ -113,7 +113,7 @@ async function readSse(res, onEvent) {
   const dump = process.env.YUANBAO_DUMP_SSE ? fs.createWriteStream(path.join(__dirname, process.env.YUANBAO_DUMP_SSE)) : null;
   const evCount = {};
   let buf = '', text = '', think = '';
-  const images = [], usage = {}, citations = [];
+  const images = [], usage = {}, citations = [], clarifies = [];
   for await (const chunk of res.body) {
     buf += dec.decode(chunk, { stream: true });
     let idx;
@@ -126,7 +126,7 @@ async function readSse(res, onEvent) {
       if (data === '[DONE]') {
         if (dump) dump.end();
         console.log('[sse] 事件统计:', JSON.stringify(evCount), 'text长度:', text.length);
-        return { text, think, images, usage, citations };
+        return { text, think, images, usage, citations, clarifies };
       }
       let ev; try { ev = JSON.parse(data); } catch { continue; }
       evCount[ev.type] = (evCount[ev.type] || 0) + 1;
@@ -139,6 +139,18 @@ async function readSse(res, onEvent) {
           if (c.type === 'think' && c.text) { think += c.text; onEvent?.('reasoning', c.text); }
           if (c.type === 'text' && c.text) { const t = cleanRich(c.text); text += t; onEvent?.('content', t); }
           if (c.type === 'toolCall' && Array.isArray(c.items)) {
+            // 深度研究反问问卷（ask_user_question → items[].type=clarify）
+            if (c.tcname === 'ask_user_question') {
+              for (const item of c.items) {
+                if (item.type === 'clarify' && Array.isArray(item.questions)) {
+                  for (const q of item.questions) {
+                    if (!clarifies.some(x => x.question === q.question)) {
+                      clarifies.push({ header: q.header || '', question: q.question || '', options: (q.options || []).map(o => o.text || '') });
+                    }
+                  }
+                }
+              }
+            }
             for (const item of c.items) for (const m of (item.multimedias || []))
               if (m.mediaType === 'image' && m.url) images.push(m.url);
           }
@@ -152,7 +164,7 @@ async function readSse(res, onEvent) {
       }
     }
   }
-  return { text, think, images, usage, citations };
+  return { text, think, images, usage, citations, clarifies };
 }
 
 function pngSize(buf) {
@@ -256,6 +268,28 @@ function extractToolCall(text) {
 
 const newCallId = () => 'call-' + crypto.randomBytes(10).toString('hex');
 
+// 取最后一条 user 消息的文本（会话复用时只发这一条）
+function lastUserContent(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      const c = messages[i].content;
+      return typeof c === 'string' ? c : JSON.stringify(c ?? '');
+    }
+  }
+  return '';
+}
+
+// 深度研究问卷 → Markdown（客户端直接可读，回复即继续）
+function formatClarifies(clarifies) {
+  const lines = ['深度研究需要先确认几个问题，请直接回复你的选择（可引用编号或原文，也可用自然语言一并说明）：', ''];
+  clarifies.forEach((q, i) => {
+    lines.push(`**${i + 1}. ${q.header ? q.header + '：' : ''}${q.question}**`);
+    q.options.forEach((o, j) => lines.push(`   ${j + 1}) ${o}`));
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
 // ---------------- OpenAI 适配层 ----------------
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -273,23 +307,70 @@ async function handleModels(req, res) {
   });
 }
 
+// ---------------- 会话粘性池 ----------------
+// 同一对话（以首条 user 消息为锚）复用元宝 conversationId：
+// 多轮时只发最新一条消息，历史由元宝服务端记忆（省 token、保上下文、支撑深度研究反问交互）。
+// LRU 上限 100，TTL 30 分钟。
+const convPool = new Map(); // anchorKey → { cid, ts }
+function convAnchor(messages) {
+  const first = (messages || []).find(m => m.role === 'user');
+  const c = typeof first?.content === 'string' ? first.content : JSON.stringify(first?.content ?? '');
+  return crypto.createHash('md5').update(c).digest('hex');
+}
+function takeConversation(messages) {
+  const key = convAnchor(messages);
+  const hit = convPool.get(key);
+  if (hit && Date.now() - hit.ts < 30 * 60 * 1000) {
+    hit.ts = Date.now();
+    convPool.delete(key); convPool.set(key, hit); // LRU touch
+    return { cid: hit.cid, reused: true };
+  }
+  return { cid: null, reused: false };
+}
+function saveConversation(messages, cid) {
+  const key = convAnchor(messages);
+  if (convPool.has(key)) convPool.delete(key);
+  convPool.set(key, { cid, ts: Date.now() });
+  while (convPool.size > 100) convPool.delete(convPool.keys().next().value);
+}
+
 async function handleChat(req, res, body) {
   const model = resolveModel(body.model);
   const hasTools = TOOLS_ENABLED && Array.isArray(body.tools) && body.tools.length > 0;
-  let prompt = messagesToPrompt(body.messages || []);
-  if (model.search) prompt = '请联网搜索相关资料，直接给出完整答案，不要向用户提问确认：\n' + prompt;
+  const noClarify = /^on|1|true|yes$/i.test(process.env.YUANBAO_NO_CLARIFY || '');
+  const reuse = takeConversation(body.messages);
+  let prompt = reuse.reused
+    ? lastUserContent(body.messages)                       // 复用会话：只发最新一条（历史在元宝侧）
+    : messagesToPrompt(body.messages || []);               // 新会话：全量拼接
+  if (model.search && !reuse.reused) {
+    prompt = (noClarify ? '请联网搜索相关资料，直接给出完整答案，不要向用户提问确认：\n' : '请联网搜索相关资料后回答：\n') + prompt;
+  }
   if (hasTools) prompt = buildToolDirective(body.tools) + '\n\n' + prompt;
   const stream = body.stream === true;
   const id = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
   const created = Math.floor(Date.now() / 1000);
 
-  const cid = await createConversation();
-  // 搜索模式走深度研究技能（协议级 applicationIdList，浏览器抓包实证），保留 prompt 指令作双保险
+  const cid = reuse.reused ? reuse.cid : await createConversation();
+  if (!reuse.reused) saveConversation(body.messages, cid);
+  // 搜索模式走深度研究技能（协议级 applicationIdList，浏览器抓包实证），仅首轮注入
   const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, '', [],
-    model.search ? ['application_id_deep_research'] : undefined);
+    model.search && !reuse.reused ? ['application_id_deep_research'] : undefined);
 
   if (!stream) {
-    const { text, think, usage, citations } = await readSse(upstream);
+    const { text, think, usage, citations, clarifies } = await readSse(upstream);
+    // 深度研究反问：把问卷透传给客户端（回复下一轮消息即继续研究）
+    if (clarifies.length) {
+      const quiz = formatClarifies(clarifies);
+      return json(res, 200, {
+        id, object: 'chat.completion', created, model: body.model,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: quiz },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
+      });
+    }
     const tc = extractToolCall(text);
     if (tc) {
       return json(res, 200, {
@@ -349,10 +430,11 @@ async function handleChat(req, res, body) {
     if (text) sendChunk({ content: text });
     return finishStream('stop', usage);
   }
-  const { usage, citations } = await readSse(upstream, (kind, piece) => {
+  const { usage, citations, clarifies } = await readSse(upstream, (kind, piece) => {
     if (kind === 'content') sendChunk({ content: piece });
     if (kind === 'reasoning') sendChunk({ reasoning_content: piece });
   });
+  if (clarifies.length) sendChunk({ content: formatClarifies(clarifies) });
   if (model.search && citations.length) {
     sendChunk({ content: '\n\n参考链接：\n' + citations.slice(0, 8).map((c, i) => `${i + 1}. [${c.title}](${c.url})`).join('\n') });
   }
