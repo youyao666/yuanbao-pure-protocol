@@ -64,8 +64,12 @@ node yuanbao-probe.js --image2img 输入图.png "把这张图里的猫变成素�
 # 6. 启动 OpenAI 兼容服务（Cherry Studio 等客户端直连）
 node yuanbao-server.js                          # 默认 http://127.0.0.1:8788/v1
 #   可选环境变量: YUANBAO_PORT=8788  YUANBAO_API_KEY=sk-xxx(开启后校验 Bearer)
-#   端点: GET /v1/models | POST /v1/chat/completions(流式/非流式)
-#         POST /v1/images/generations | POST /v1/images/edits(标准multipart) | GET /healthz
+#                YUANBAO_TOOLS=off  (关闭工具调用模拟)
+#   端点: GET  /v1/models
+#         POST /v1/chat/completions（流式/非流式；支持 tools/tool_calls 工具调用）
+#         POST /v1/images/generations（文生图，同步）
+#         POST /v1/images/async + GET /v1/images/async/{id}（异步生图：提交即返回、轮询取图）
+#         POST /v1/images/edits（图生图，标准 multipart） | GET /healthz
 
 # 7. cookie 过期后（表现为 401）：重跑登录器
 node yuanbao-login.js
@@ -98,6 +102,8 @@ SSE 响应:
 
 - **网页改版后签名失效**：表现为 create 返回 400/401 或"服务繁忙"。此时需重新 dump `qimei-modules.json`：用浏览器打开元宝 → 控制台执行 `webpackChunk_N_E.push([[tag],{},q=>window.__wr=q])` 钩出模块表 → 导出 `__wr.m` 全量源码合并为 `{modules:{id:source}}` JSON。入口模块 ID 会漂移（当前为 77004，历史上有 12601 等），可扫描含 `getUSKeySync` 字符串的模块定位。
 - **控制台噪音**：SDK 初始化时会向 console 打印环境探测对象（无害），关键输出均带 `[probe]`/`[login]` 前缀，可 grep 过滤。
+- **工具调用是提示词注入式模拟**：元宝协议不透传 `tools`，服务把工具定义注入 prompt 并解析模型输出的 `<<TOOL_CALL>>` 标记转换为 OpenAI `tool_calls` 格式（流式请求带 tools 时自动切换为缓冲模式）。可靠性依赖模型遵循指令（Hy4 实测稳定）。服务级总开关 `YUANBAO_TOOLS=off`；请求级开关天然存在（不带 tools 数组即不启用）。
+- **异步生图任务表是内存态**：服务重启即清空，未做持久化。
 - **token 寿命**：实测持续有效中（具体寿命待观察）；401 即重跑登录器。
 - **意图路由对措辞敏感**（服务端意图模型判定，非本工具问题）：文生图 prompt 需带绘画动词（缺了 server 会自动补"画："前缀）；图生图带 `plugin:""`（`Adaptive` 会走图片理解分支只出文字）；"用户：xxx"式对话前缀会触发搜索模式（prompt 膨胀、输出碎片化），所以 server 的 messages 拼接刻意避开。
 - **请求头必须整套**：网关校验浏览器头完整性，缺 `x-requested-with`/`x-commit-tag`/`x-instance-id` 等会返回"服务繁忙，请稍后再试"（= 签名/风控拒绝）。

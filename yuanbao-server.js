@@ -10,6 +10,8 @@ const { createSigner } = require('./qimei-standalone.js');
 const signer = createSigner();
 const PORT = process.env.YUANBAO_PORT || 8788;
 const API_KEY = process.env.YUANBAO_API_KEY || '';
+// 工具调用总开关：YUANBAO_TOOLS=off 关闭（提示词注入式模拟，关闭后请求带 tools 也会被忽略）
+const TOOLS_ENABLED = !/^off|0|false|no$/i.test(process.env.YUANBAO_TOOLS || '');
 const BASE = 'https://yuanbao.tencent.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
@@ -93,6 +95,9 @@ async function yuanbaoChat(cid, prompt, chatModelId, plugin, multimedia) {
   return res;
 }
 
+// 清理元宝富文本内联标记（如 [](@mark_underline=1)），OpenAI 客户端不识别
+const cleanRich = s => s.replace(/\[\]\(@[a-z_]+=\d+\)/g, '');
+
 // 逐事件回调读 SSE（供流式转发）；返回汇总 {text, think, images, usage}
 async function readSse(res, onEvent) {
   const dec = new TextDecoder();
@@ -119,7 +124,7 @@ async function readSse(res, onEvent) {
       if (ev.type === 'deepSearchAgent' && Array.isArray(ev.contents)) {
         for (const c of ev.contents) {
           if (c.type === 'think' && c.text) { think += c.text; onEvent?.('reasoning', c.text); }
-          if (c.type === 'text' && c.text) { text += c.text; onEvent?.('content', c.text); }
+          if (c.type === 'text' && c.text) { const t = cleanRich(c.text); text += t; onEvent?.('content', t); }
           if (c.type === 'toolCall' && Array.isArray(c.items)) {
             for (const item of c.items) for (const m of (item.multimedias || []))
               if (m.mediaType === 'image' && m.url) images.push(m.url);
@@ -127,7 +132,7 @@ async function readSse(res, onEvent) {
         }
       } else if (ev.type === 'replace' && ev.replace?.assetId && Array.isArray(ev.replace.multimedias)) {
         for (const m of ev.replace.multimedias) if (m.mediaType === 'image' && m.url) images.push(m.url);
-      } else if (ev.type === 'text' && ev.msg) { text += ev.msg; onEvent?.('content', ev.msg); }
+      } else if (ev.type === 'text' && ev.msg) { const t = cleanRich(ev.msg); text += t; onEvent?.('content', t); }
       if (ev.type === 'meta' && ev.tokenUsageInfo) {
         usage.prompt = ev.tokenUsageInfo.promptTokens; usage.completion = ev.tokenUsageInfo.completionTokens;
         usage.total = ev.tokenUsageInfo.totalTokens;
@@ -175,19 +180,68 @@ async function uploadImage(buf, fileName) {
 function messagesToPrompt(messages) {
   const sys = messages.filter(m => m.role === 'system' || m.role === 'developer').map(m => m.content).join('\n');
   const turns = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
-  const lastUser = turns[turns.length - 1]?.role === 'user' ? turns[turns.length - 1] : turns[turns.length - 1];
+  const last = turns[turns.length - 1];
   const contentOf = m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
   const history = turns.slice(0, -1);
   let prompt = '';
   if (sys) prompt += sys + '\n\n';
   if (history.length) {
     prompt += '先前的交流背景（供参考）：\n';
-    for (const m of history) prompt += `- ${m.role === 'assistant' ? '此前的回答' : '此前的问题'}：${contentOf(m)}\n`;
+    for (const m of history) {
+      if (m.role === 'tool') {
+        prompt += `- 工具返回结果：${contentOf(m)}\n`;
+      } else if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        const calls = m.tool_calls.map(c => `${c.function.name}(${c.function.arguments})`).join('; ');
+        prompt += `- 此前请求调用工具：${calls}（等待结果中）\n`;
+      } else {
+        prompt += `- ${m.role === 'assistant' ? '此前的回答' : '此前的问题'}：${contentOf(m)}\n`;
+      }
+    }
     prompt += '\n';
   }
-  prompt += contentOf(lastUser ?? { content: '' });
+  prompt += contentOf(last ?? { content: '' });
   return prompt;
 }
+
+// ---------------- 工具调用（提示词注入式 function calling） ----------------
+// 元宝协议不透传 tools，采用社区通行方案：工具定义注入 prompt，
+// 解析模型输出的 <<TOOL_CALL>> 标记转换为 OpenAI tool_calls 格式。
+function buildToolDirective(tools) {
+  const defs = tools.map(t => {
+    const f = t.function || t;
+    return { name: f.name, description: f.description || '', parameters: f.parameters || { type: 'object', properties: {} } };
+  });
+  return [
+    '你可以调用以下工具来获取回答问题所需的信息：',
+    ...defs.map(d => `- 工具名：${d.name}\n  说明：${d.description}\n  参数JSON Schema：${JSON.stringify(d.parameters)}`),
+    '',
+    '规则：',
+    '1. 当且仅当确实需要工具提供的信息时才调用；能直接回答就直接回答。',
+    '2. 需要调用时，回复中只输出如下格式的一行（不要输出任何其它内容）：',
+    '<<TOOL_CALL>>{"name":"工具名","arguments":{参数对象}}',
+    '3. 输出调用后即停止，等待工具结果再继续。',
+    '4. 绝不编造工具返回的结果。',
+  ].join('\n');
+}
+
+function extractToolCall(text) {
+  const idx = text.indexOf('<<TOOL_CALL>>');
+  if (idx === -1) return null;
+  const rest = text.slice(idx + '<<TOOL_CALL>>'.length);
+  const start = rest.indexOf('{');
+  const end = rest.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const call = JSON.parse(rest.slice(start, end + 1));
+    if (!call.name) return null;
+    return {
+      name: call.name,
+      arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments || {}),
+    };
+  } catch { return null; }
+}
+
+const newCallId = () => 'call-' + crypto.randomBytes(10).toString('hex');
 
 // ---------------- OpenAI 适配层 ----------------
 function json(res, code, obj) {
@@ -207,7 +261,9 @@ async function handleModels(req, res) {
 
 async function handleChat(req, res, body) {
   const model = resolveModel(body.model);
-  const prompt = messagesToPrompt(body.messages || []);
+  const hasTools = TOOLS_ENABLED && Array.isArray(body.tools) && body.tools.length > 0;
+  let prompt = messagesToPrompt(body.messages || []);
+  if (hasTools) prompt = buildToolDirective(body.tools) + '\n\n' + prompt;
   const stream = body.stream === true;
   const id = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
   const created = Math.floor(Date.now() / 1000);
@@ -217,6 +273,21 @@ async function handleChat(req, res, body) {
 
   if (!stream) {
     const { text, think, usage } = await readSse(upstream);
+    const tc = extractToolCall(text);
+    if (tc) {
+      return json(res, 200, {
+        id, object: 'chat.completion', created, model: body.model,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant', content: null,
+            tool_calls: [{ id: newCallId(), type: 'function', function: tc }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
+      });
+    }
     return json(res, 200, {
       id, object: 'chat.completion', created, model: body.model,
       choices: [{
@@ -227,27 +298,41 @@ async function handleChat(req, res, body) {
       usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
     });
   }
-  // 流式：SSE 转发
+  // 流式：SSE 转发。带 tools 时用缓冲模式（等完整响应再判定 tool_calls / 普通内容一次性发）
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*',
   });
-  const sendChunk = delta => res.write('data: ' + JSON.stringify({
+  const sendChunk = (delta, finish = null) => res.write('data: ' + JSON.stringify({
     id, object: 'chat.completion.chunk', created, model: body.model,
-    choices: [{ index: 0, delta, finish_reason: null }],
+    choices: [{ index: 0, delta, finish_reason: finish }],
   }) + '\n\n');
+  const finishStream = (finish, usage) => {
+    res.write('data: ' + JSON.stringify({
+      id, object: 'chat.completion.chunk', created, model: body.model,
+      choices: [{ index: 0, delta: {}, finish_reason: finish }],
+      usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
+    }) + '\n\n');
+    res.write('data: [DONE]\n\n');
+    res.end();
+  };
   sendChunk({ role: 'assistant' });
+
+  if (hasTools) {
+    const { text, usage } = await readSse(upstream);
+    const tc = extractToolCall(text);
+    if (tc) {
+      sendChunk({ tool_calls: [{ index: 0, id: newCallId(), type: 'function', function: tc }] });
+      return finishStream('tool_calls', usage);
+    }
+    if (text) sendChunk({ content: text });
+    return finishStream('stop', usage);
+  }
   const { usage } = await readSse(upstream, (kind, piece) => {
     if (kind === 'content') sendChunk({ content: piece });
     if (kind === 'reasoning') sendChunk({ reasoning_content: piece });
   });
-  res.write('data: ' + JSON.stringify({
-    id, object: 'chat.completion.chunk', created, model: body.model,
-    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-    usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
-  }) + '\n\n');
-  res.write('data: [DONE]\n\n');
-  res.end();
+  finishStream('stop', usage);
 }
 
 async function handleImageGen(req, res, body) {
@@ -270,6 +355,53 @@ async function handleImageGen(req, res, body) {
     data = data.map(u => ({ url: u }));
   }
   json(res, 200, { created: Math.floor(Date.now() / 1000), data });
+}
+
+// ---------------- 异步生图（任务式：提交即返回，轮询取结果） ----------------
+// 任务表为内存态，服务重启即清空（研究工具定位，未做持久化）
+const asyncTasks = new Map();
+
+async function handleImageGenAsync(req, res, body) {
+  let prompt = body.prompt || '';
+  if (!prompt) return json(res, 400, { error: { message: 'prompt required' } });
+  if (!/^(画|绘|生成|创作|draw|create|imagine)/i.test(prompt)) prompt = '画：' + prompt;
+  const b64 = body.response_format === 'b64_json';
+  const id = 'imgtask-' + crypto.randomBytes(10).toString('hex');
+  const task = { id, status: 'processing', created_at: Math.floor(Date.now() / 1000), data: null, error: null };
+  asyncTasks.set(id, task);
+  // 超过 200 条清理最旧任务，防内存膨胀
+  if (asyncTasks.size > 200) {
+    const oldest = asyncTasks.keys().next().value;
+    asyncTasks.delete(oldest);
+  }
+  (async () => {
+    try {
+      const cid = await createConversation();
+      const upstream = await yuanbaoChat(cid, prompt, 'hunyuan_omnipotent_hy4', 'Adaptive', []);
+      const { images } = await readSse(upstream);
+      if (!images.length) throw new Error('未生成任何图片（意图未路由到生图，可尝试加绘画动词）');
+      task.data = b64
+        ? await Promise.all(images.map(async u => {
+            const r = await fetch(u);
+            return { b64_json: Buffer.from(await r.arrayBuffer()).toString('base64') };
+          }))
+        : images.map(u => ({ url: u }));
+      task.status = 'succeeded';
+    } catch (e) {
+      task.error = e.message;
+      task.status = 'failed';
+    }
+  })();
+  json(res, 200, { id, object: 'image_generation_task', status: task.status, created_at: task.created_at });
+}
+
+function handleImageTaskStatus(req, res, id) {
+  const task = asyncTasks.get(id);
+  if (!task) return json(res, 404, { error: { message: 'task not found: ' + id } });
+  const out = { id: task.id, object: 'image_generation_task', status: task.status, created_at: task.created_at };
+  if (task.data) out.data = task.data;
+  if (task.error) out.error = { message: task.error };
+  json(res, 200, out);
 }
 
 async function handleImageEdit(req, res, fields, files) {
@@ -362,6 +494,13 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
       return await handleImageGen(req, res, body);
     }
+    if (req.method === 'POST' && req.url === '/v1/images/async') {
+      const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+      return await handleImageGenAsync(req, res, body);
+    }
+    if (req.method === 'GET' && req.url.startsWith('/v1/images/async/')) {
+      return handleImageTaskStatus(req, res, req.url.slice('/v1/images/async/'.length).split('?')[0]);
+    }
     if (req.method === 'POST' && req.url === '/v1/images/edits') {
       const raw = await readBody(req);
       const ct = req.headers['content-type'] || '';
@@ -379,4 +518,5 @@ server.listen(PORT, () => {
   console.log(`[yuanbao-server] OpenAI 兼容层就绪: http://127.0.0.1:${PORT}/v1`);
   console.log(`[yuanbao-server] 模型: ${Object.keys(MODEL_ALIAS).join(', ')}`);
   console.log(`[yuanbao-server] 鉴权: ${API_KEY ? '已开启 (YUANBAO_API_KEY)' : '关闭（局域网裸奔，注意）'}`);
+  console.log(`[yuanbao-server] 工具调用: ${TOOLS_ENABLED ? '开启（请求带 tools 即启用；YUANBAO_TOOLS=off 可关）' : '已关闭 (YUANBAO_TOOLS=off)'}`);
 });
