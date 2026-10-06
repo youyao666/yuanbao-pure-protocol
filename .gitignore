@@ -1,0 +1,5 @@
+# 敏感凭据与设备指纹，严禁入库
+yuanbao-cookie.json
+qimei-storage.json
+# 中间产物
+qimei-all-*.json
