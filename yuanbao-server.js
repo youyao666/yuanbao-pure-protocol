@@ -21,7 +21,7 @@ const cookie = JSON.parse(fs.readFileSync(process.env.YUANBAO_COOKIE
   ? process.env.YUANBAO_COOKIE
   : path.join(__dirname, 'yuanbao-cookie.json'), 'utf8'));
 
-// OpenAI 模型名 → 元宝内部 chatModelId
+// OpenAI 模型名 → 元宝内部 chatModelId（-search 后缀 = 强制联网搜索模式）
 const MODEL_ALIAS = {
   'deepseek': 'deep_seek_v3',
   'deepseek-v3': 'deep_seek_v3',
@@ -33,7 +33,14 @@ const MODEL_ALIAS = {
   'hy4': 'hunyuan_omnipotent_hy4',
   'hunyuan_omnipotent_hy4': 'hunyuan_omnipotent_hy4',
 };
-const resolveModel = name => MODEL_ALIAS[(name || '').toLowerCase()] || MODEL_ALIAS[name] || 'hunyuan_omnipotent_hy4';
+const SEARCH_SUFFIX = '-search';
+function resolveModel(name) {
+  const n = String(name || '');
+  const search = n.toLowerCase().endsWith(SEARCH_SUFFIX);
+  const base = search ? n.slice(0, -SEARCH_SUFFIX.length) : n;
+  const chatModelId = MODEL_ALIAS[base.toLowerCase()] || MODEL_ALIAS[base] || 'hunyuan_omnipotent_hy4';
+  return { chatModelId, search, display: n };
+}
 
 // ---------------- 元宝协议层（与探针同源） ----------------
 function baseHeaders(sec) {
@@ -106,7 +113,7 @@ async function readSse(res, onEvent) {
   const dump = process.env.YUANBAO_DUMP_SSE ? fs.createWriteStream(path.join(__dirname, process.env.YUANBAO_DUMP_SSE)) : null;
   const evCount = {};
   let buf = '', text = '', think = '';
-  const images = [], usage = {};
+  const images = [], usage = {}, citations = [];
   for await (const chunk of res.body) {
     buf += dec.decode(chunk, { stream: true });
     let idx;
@@ -119,10 +126,14 @@ async function readSse(res, onEvent) {
       if (data === '[DONE]') {
         if (dump) dump.end();
         console.log('[sse] 事件统计:', JSON.stringify(evCount), 'text长度:', text.length);
-        return { text, think, images, usage };
+        return { text, think, images, usage, citations };
       }
       let ev; try { ev = JSON.parse(data); } catch { continue; }
       evCount[ev.type] = (evCount[ev.type] || 0) + 1;
+      // 联网搜索引用（searchGuid.docs）
+      if (ev.type === 'searchGuid' && Array.isArray(ev.docs)) {
+        for (const d of ev.docs) if (d.url) citations.push({ title: d.title || d.url, url: d.url });
+      }
       if (ev.type === 'deepSearchAgent' && Array.isArray(ev.contents)) {
         for (const c of ev.contents) {
           if (c.type === 'think' && c.text) { think += c.text; onEvent?.('reasoning', c.text); }
@@ -141,7 +152,7 @@ async function readSse(res, onEvent) {
       }
     }
   }
-  return { text, think, images, usage };
+  return { text, think, images, usage, citations };
 }
 
 function pngSize(buf) {
@@ -253,9 +264,10 @@ function json(res, code, obj) {
 }
 
 async function handleModels(req, res) {
+  const ids = [...Object.keys(MODEL_ALIAS), ...Object.keys(MODEL_ALIAS).map(id => id + SEARCH_SUFFIX)];
   json(res, 200, {
     object: 'list',
-    data: Object.keys(MODEL_ALIAS).map((id, i) => ({
+    data: ids.map((id, i) => ({
       id, object: 'model', created: 1704067200 + i, owned_by: 'yuanbao',
     })),
   });
@@ -265,16 +277,17 @@ async function handleChat(req, res, body) {
   const model = resolveModel(body.model);
   const hasTools = TOOLS_ENABLED && Array.isArray(body.tools) && body.tools.length > 0;
   let prompt = messagesToPrompt(body.messages || []);
+  if (model.search) prompt = '请联网搜索相关资料后回答：\n' + prompt;
   if (hasTools) prompt = buildToolDirective(body.tools) + '\n\n' + prompt;
   const stream = body.stream === true;
   const id = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
   const created = Math.floor(Date.now() / 1000);
 
   const cid = await createConversation();
-  const upstream = await yuanbaoChat(cid, prompt, model, '', []);
+  const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, '', []);
 
   if (!stream) {
-    const { text, think, usage } = await readSse(upstream);
+    const { text, think, usage, citations } = await readSse(upstream);
     const tc = extractToolCall(text);
     if (tc) {
       return json(res, 200, {
@@ -290,11 +303,15 @@ async function handleChat(req, res, body) {
         usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
       });
     }
+    let content = text;
+    if (model.search && citations.length) {
+      content += '\n\n参考链接：\n' + citations.slice(0, 8).map((c, i) => `${i + 1}. [${c.title}](${c.url})`).join('\n');
+    }
     return json(res, 200, {
       id, object: 'chat.completion', created, model: body.model,
       choices: [{
         index: 0,
-        message: { role: 'assistant', content: text, ...(think ? { reasoning_content: think } : {}) },
+        message: { role: 'assistant', content, ...(think ? { reasoning_content: think } : {}) },
         finish_reason: 'stop',
       }],
       usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
@@ -330,10 +347,13 @@ async function handleChat(req, res, body) {
     if (text) sendChunk({ content: text });
     return finishStream('stop', usage);
   }
-  const { usage } = await readSse(upstream, (kind, piece) => {
+  const { usage, citations } = await readSse(upstream, (kind, piece) => {
     if (kind === 'content') sendChunk({ content: piece });
     if (kind === 'reasoning') sendChunk({ reasoning_content: piece });
   });
+  if (model.search && citations.length) {
+    sendChunk({ content: '\n\n参考链接：\n' + citations.slice(0, 8).map((c, i) => `${i + 1}. [${c.title}](${c.url})`).join('\n') });
+  }
   finishStream('stop', usage);
 }
 
@@ -361,11 +381,26 @@ async function enrichWatermarkFree(cid, urls) {
   }
 }
 
+// 生图比例：OpenAI size 风格与比例风格统一映射为画幅指令（1:1 是元宝默认，不加指令）
+const SIZE_RATIO = {
+  '1024x1024': '1:1', '1:1': '1:1', 'square': '1:1',
+  '1792x1024': '16:9', '1536x1024': '3:2', '16:9': '16:9', 'landscape': '16:9', '横版': '16:9',
+  '1024x1792': '9:16', '1024x1536': '2:3', '9:16': '9:16', 'portrait': '9:16', '竖版': '9:16',
+  '1440x1080': '4:3', '4:3': '4:3',
+  '1080x1440': '3:4', '3:4': '3:4',
+};
+function ratioHint(size) {
+  if (!size) return '';
+  const r = SIZE_RATIO[String(size).toLowerCase()];
+  return r && r !== '1:1' ? `，画幅比例 ${r}` : '';
+}
+
 async function handleImageGen(req, res, body) {
   let prompt = body.prompt || '';
   if (!prompt) return json(res, 400, { error: { message: 'prompt required' } });
   // 元宝意图判定依赖绘画动词，缺了会走纯文字回复（实测 oneAgentId=main_agent_hy_for_pc）
   if (!/^(画|绘|生成|创作|draw|create|imagine)/i.test(prompt)) prompt = '画：' + prompt;
+  prompt += ratioHint(body.size);
   const b64 = body.response_format === 'b64_json';
   const cid = await createConversation();
   const upstream = await yuanbaoChat(cid, prompt, 'hunyuan_omnipotent_hy4', 'Adaptive', []);
@@ -392,6 +427,7 @@ async function handleImageGenAsync(req, res, body) {
   let prompt = body.prompt || '';
   if (!prompt) return json(res, 400, { error: { message: 'prompt required' } });
   if (!/^(画|绘|生成|创作|draw|create|imagine)/i.test(prompt)) prompt = '画：' + prompt;
+  prompt += ratioHint(body.size);
   const b64 = body.response_format === 'b64_json';
   const id = 'imgtask-' + crypto.randomBytes(10).toString('hex');
   const task = { id, status: 'processing', created_at: Math.floor(Date.now() / 1000), data: null, error: null };
@@ -539,7 +575,14 @@ const server = http.createServer(async (req, res) => {
     }
     json(res, 404, { error: { message: 'not found: ' + req.url } });
   } catch (e) {
-    json(res, 502, { error: { message: 'yuanbao upstream error: ' + e.message, type: 'upstream_error' } });
+    const msg = String(e.message || '');
+    // 元宝凭据过期（实测错误码：20001 token无效 / 23000 登录已过期）
+    if (/20001|23000|token无效|登录已过期/.test(msg)) {
+      return json(res, 401, {
+        error: { message: 'yuanbao cookie 已过期：请运行 node yuanbao-login.js 重新扫码登录', type: 'invalid_credentials', code: 'yuanbao_token_expired' },
+      });
+    }
+    json(res, 502, { error: { message: 'yuanbao upstream error: ' + msg, type: 'upstream_error' } });
   }
 });
 

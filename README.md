@@ -68,9 +68,12 @@ node yuanbao-server.js                          # 默认 http://127.0.0.1:8788/v
 #                YUANBAO_WATERMARK_FREE=off  (关闭无水印换链，默认返回无水印原图)
 #   端点: GET  /v1/models
 #         POST /v1/chat/completions（流式/非流式；支持 tools/tool_calls 工具调用）
-#         POST /v1/images/generations（文生图，同步）
+#         POST /v1/images/generations（文生图，同步；size 可指定画幅 16:9/9:16/4:3/3:4
+#               或 OpenAI 风格 1792x1024 等）
 #         POST /v1/images/async + GET /v1/images/async/{id}（异步生图：提交即返回、轮询取图）
 #         POST /v1/images/edits（图生图，标准 multipart） | GET /healthz
+#   模型: 任一模型名加 -search 后缀 = 强制联网搜索模式（回答末尾附参考链接），
+#         如 hy4-search / deepseek-search
 
 # 7. cookie 过期后（表现为 401）：重跑登录器
 node yuanbao-login.js
@@ -106,6 +109,9 @@ SSE 响应:
 - **无水印换链**：SSE 返回的生图直链是 `h1_`（带"元宝 AI生成"水印）版；会话详情接口里每张图另带 `originUrl`（`h0_` 原始无水印版）。生图端点完成后自动按路径匹配替换为 `originUrl` 返回（实测 h0 3786KB vs h1 3527KB，确为两个文件）。总开关 `YUANBAO_WATERMARK_FREE=off`。图生图另有模型侧去水印：模型扩写 prompt 时会主动加"去除水印"指令。
 - **工具调用是提示词注入式模拟**：元宝协议不透传 `tools`，服务把工具定义注入 prompt 并解析模型输出的 `<<TOOL_CALL>>` 标记转换为 OpenAI `tool_calls` 格式（流式请求带 tools 时自动切换为缓冲模式）。可靠性依赖模型遵循指令（Hy4 实测稳定）。服务级总开关 `YUANBAO_TOOLS=off`；请求级开关天然存在（不带 tools 数组即不启用）。
 - **异步生图任务表是内存态**：服务重启即清空，未做持久化。
+- **搜索模式是 prompt 指令强制 + 引用收集**：`-search` 后缀模型在 prompt 前置联网指令，SSE 的 `searchGuid.docs`（title/url/quote）被收集为"参考链接"附在回答末尾。不保证每次都触发搜索（意图模型仍有裁量权）。
+- **生图比例走 prompt 指令**：`size` 参数映射为"画幅比例 X:Y"追加到 prompt（元宝生图无原生比例参数），实测 16:9 → 2048x1152 精确生效。
+- **凭据过期识别**：上游错误码 20001/23000 会被转成 HTTP 401 + `code: yuanbao_token_expired`，提示运行登录器。
 - **token 寿命**：实测持续有效中（具体寿命待观察）；401 即重跑登录器。
 - **意图路由对措辞敏感**（服务端意图模型判定，非本工具问题）：文生图 prompt 需带绘画动词（缺了 server 会自动补"画："前缀）；图生图带 `plugin:""`（`Adaptive` 会走图片理解分支只出文字）；"用户：xxx"式对话前缀会触发搜索模式（prompt 膨胀、输出碎片化），所以 server 的 messages 拼接刻意避开。
 - **请求头必须整套**：网关校验浏览器头完整性，缺 `x-requested-with`/`x-commit-tag`/`x-instance-id` 等会返回"服务繁忙，请稍后再试"（= 签名/风控拒绝）。
