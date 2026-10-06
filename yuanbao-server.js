@@ -597,6 +597,42 @@ async function handleImageEdit(req, res, fields, files) {
   json(res, 200, { created: Math.floor(Date.now() / 1000), data });
 }
 
+// ---------------- 图片编辑五件套（协议已验证；上游 retouch 服务恢复后即刻可用） ----------------
+// POST /api/image/{op}，body {imageUrl, initOperateType, isReset}，无需 QIMEI 签名，SSE 进度流
+const IMAGE_OPS = {
+  clarity: { path: 'clarity', type: 1 },
+  removewatermark: { path: 'removewatermark', type: 2 },
+  style: { path: 'style', type: 3 },
+  outpainting: { path: 'outpainting', type: 4 },
+  elimination: { path: 'elimination', type: 5 },
+};
+
+async function handleImageEditOp(req, res, fields, files) {
+  const op = IMAGE_OPS[String(fields.operation || '').toLowerCase()];
+  const imageFile = files.image || files.file;
+  if (!op) return json(res, 400, { error: { message: 'operation 必须是: ' + Object.keys(IMAGE_OPS).join('/') } });
+  if (!imageFile) return json(res, 400, { error: { message: 'image(multipart) required' } });
+
+  const mm = await uploadImage(imageFile.data, imageFile.filename || 'image.png');
+  // uploadImage 返回 resourceUrl（resource/download 引用），编辑接口需要可访问的图 URL —— 直接透传
+  const res2 = await fetch(`${BASE}/api/image/${op.path}`, {
+    method: 'POST', headers: baseHeaders(),
+    body: JSON.stringify({ imageUrl: mm.url, initOperateType: op.type, isReset: false }),
+  });
+  if (!res2.ok) return json(res, 502, { error: { message: `image edit HTTP ${res2.status}` } });
+  // 读 SSE：progress 到终点，取结果 URL（成功字段名未实测到——多候选提取 + 尾事件透传兜底）
+  const text = await res2.text();
+  const events = text.split('\n').filter(l => l.startsWith('data: ')).map(l => l.slice(6));
+  const tail = events.filter(e => e !== '[DONE]' && !e.startsWith('[TRACE')).slice(-2);
+  const errEv = events.map(e => { try { return JSON.parse(e); } catch { return null; } }).find(e => e?.type === 'error');
+  if (errEv) {
+    return json(res, 502, { error: { message: '上游修图服务错误（腾讯 retouch 微服务可能超时）: ' + String(errEv.msg || '').slice(0, 160), type: 'upstream_error' } });
+  }
+  const m = text.match(/"(?:resultUrl|imageUrl|newUrl|outputUrl|url)":"(https:[^"]+)"/);
+  if (m) return json(res, 200, { created: Math.floor(Date.now() / 1000), data: [{ url: m[1] }] });
+  return json(res, 502, { error: { message: '未解析到结果图（上游形态未知，尾事件透传）', upstream_tail: tail } });
+}
+
 // ---------------- 基础设施 ----------------
 function readBody(req) {
   return new Promise((ok, bad) => {
@@ -678,6 +714,13 @@ const server = http.createServer(async (req, res) => {
       if (!ct.includes('multipart')) return json(res, 400, { error: { message: 'multipart/form-data required' } });
       const { fields, files } = parseMultipart(raw, ct);
       return await handleImageEdit(req, res, fields, files);
+    }
+    if (req.method === 'POST' && req.url === '/v1/images/edit') {
+      const raw = await readBody(req);
+      const ct = req.headers['content-type'] || '';
+      if (!ct.includes('multipart')) return json(res, 400, { error: { message: 'multipart/form-data required' } });
+      const { fields, files } = parseMultipart(raw, ct);
+      return await handleImageEditOp(req, res, fields, files);
     }
     json(res, 404, { error: { message: 'not found: ' + req.url } });
   } catch (e) {
