@@ -1,5 +1,9 @@
 # 元宝纯协议工具包（yuanbao-pure-protocol）
 
+> **项目状态：暂时完结（feature-complete）** 🏁
+> 协议栈自签名层（QIMEI SDK 搬迁）至业务层（chat / 图像 / 文档 / 编辑 / 登录）已全覆盖并实测。
+> 进入观察期，恢复开发的触发信号见"维护与排障"末尾的待办票。观察期内 cookie 过期属正常，重跑登录器即可。
+
 腾讯元宝网页版（yuanbao.tencent.com）的纯协议实现：**零浏览器、纯 Node 直连**，支持文本对话（流式）、AI 生图（文生图 + 图生图）、扫码自动登录。
 
 研究性质项目，请勿商用；账号风险自负。
@@ -110,6 +114,14 @@ SSE 响应:
 - **无水印换链**：SSE 返回的生图直链是 `h1_`（带"元宝 AI生成"水印）版；会话详情接口里每张图另带 `originUrl`（`h0_` 原始无水印版）。生图端点完成后自动按路径匹配替换为 `originUrl` 返回（实测 h0 3786KB vs h1 3527KB，确为两个文件）。总开关 `YUANBAO_WATERMARK_FREE=off`。图生图另有模型侧去水印：模型扩写 prompt 时会主动加"去除水印"指令。
 - **工具调用是提示词注入式模拟**：元宝协议不透传 `tools`，服务把工具定义注入 prompt 并解析模型输出的 `<<TOOL_CALL>>` 标记转换为 OpenAI `tool_calls` 格式（流式请求带 tools 时自动切换为缓冲模式）。可靠性依赖模型遵循指令（Hy4 实测稳定）。服务级总开关 `YUANBAO_TOOLS=off`；请求级开关天然存在（不带 tools 数组即不启用）。
 - **异步生图任务表是内存态**：服务重启即清空，未做持久化。
+
+### 待办票（恢复开发的触发信号）
+
+| 信号 | 触发方式 | 开工内容 |
+|---|---|---|
+| 修图服务恢复 | 直打一发 `POST /api/image/removewatermark` 无 error 即恢复 | `/v1/images/edit` 端点转正 + 确认成功结果字段名 |
+| 视频灰度转正 | `POST /api/v1/config/aigc/get-tab-list` 返回非空 tab | 浏览器创作页抓包 `directGenerate` → 复刻视频生成端点 |
+| 技能授权链 | 挖通 `skill_market/details` 参数 + 连接器 OAuth | 激活腾讯文档/携程/行情等 20 个技能 |
 - **搜索模式已升级为协议级**：`-search` 后缀走"深度研究"技能（`applicationIdList: ["application_id_deep_research"]`，浏览器抓包实证）。深度研究 agent 可能先反问确认——**问卷会透传给客户端**（结构化 Markdown，含选项与推荐项），客户端把回答作为下一轮消息发来即在同一会话继续研究直至出报告。`YUANBAO_NO_CLARIFY=on` 可恢复"不提问直接答"模式。引用来自 SSE `searchGuid.docs`。
 - **会话粘性池的键设计**：`user` 字段（多人 gateway 的租户隔离，OpenAI 标准参数）+ messages 前缀指纹（去掉最后一条消息的全量 hash，含 assistant 回复与 tool_calls 序列化）。首轮历史为空不查池（必新建）；响应完成后以"历史 + 本轮回复"为下一轮存锚；复用时只发最新一条消息，历史由元宝服务端记忆（LRU 100 / TTL 30 分钟）。实测同 user 多轮上下文延续、异 user 不串。残余限制：同 user 且整段历史逐字相同的两条独立对话仍会互粘——这是无状态请求协议的本质极限，多人共用请务必传 `user`。
 - **技能广场（skill market）半开矿脉**：端点族 `/api/v1/yuanbao_skill_market/{skills|panel_skills|details|install|uninstall|report_use|connectors}`（纯协议可拉清单，当前 20 个技能：腾讯文档/携程/行情/选股/旅游计划等）；另有连接器授权体系 `/api/connector/v1/connectors/authGuide`（第三方技能需 OAuth）。chat 带 `skillId` 会触发更严格校验（实测"服务繁忙"），正确激活需技能详情（真实 skillId 形态）+ 可能的连接器授权，待续。
