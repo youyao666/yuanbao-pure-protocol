@@ -308,17 +308,27 @@ async function handleModels(req, res) {
 }
 
 // ---------------- 会话粘性池 ----------------
-// 同一对话（以首条 user 消息为锚）复用元宝 conversationId：
-// 多轮时只发最新一条消息，历史由元宝服务端记忆（省 token、保上下文、支撑深度研究反问交互）。
+// 同一对话复用元宝 conversationId：多轮时只发最新一条消息，历史由元宝服务端记忆。
+// 锚 = 客户端 user 字段（多人 gateway 隔离）+ messages 前缀指纹（去掉最后一条消息的全量 hash，
+// 含 assistant 回复与 tool_calls 序列化）。首轮历史为空不查池（必新建）。
+// 响应完成后存 hash(历史 + 本轮 assistant 回复) —— 下一轮客户端带回该回复，键恰好对上。
 // LRU 上限 100，TTL 30 分钟。
-const convPool = new Map(); // anchorKey → { cid, ts }
-function convAnchor(messages) {
-  const first = (messages || []).find(m => m.role === 'user');
-  const c = typeof first?.content === 'string' ? first.content : JSON.stringify(first?.content ?? '');
-  return crypto.createHash('md5').update(c).digest('hex');
+const convPool = new Map(); // key → { cid, ts }
+function convKeyOf(messages, user) {
+  const norm = messages.map(m => [
+    m.role || '',
+    typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? null),
+    Array.isArray(m.tool_calls) ? m.tool_calls.map(t => (t.function?.name || '') + ':' + (t.function?.arguments || '')).join(',') : '',
+  ]);
+  return crypto.createHash('md5')
+    .update(JSON.stringify(norm))
+    .update('|user=' + (user || 'anon'))
+    .digest('hex');
 }
-function takeConversation(messages) {
-  const key = convAnchor(messages);
+function takeConversation(messages, user) {
+  const hist = (messages || []).slice(0, -1);
+  if (!hist.length) return { cid: null, reused: false }; // 首轮：必新建
+  const key = convKeyOf(hist, user);
   const hit = convPool.get(key);
   if (hit && Date.now() - hit.ts < 30 * 60 * 1000) {
     hit.ts = Date.now();
@@ -327,8 +337,9 @@ function takeConversation(messages) {
   }
   return { cid: null, reused: false };
 }
-function saveConversation(messages, cid) {
-  const key = convAnchor(messages);
+function saveConversation(messages, user, cid, assistantMsg) {
+  // 以"历史 + 本轮回复"为下一轮的锚
+  const key = convKeyOf([...(messages || []), assistantMsg], user);
   if (convPool.has(key)) convPool.delete(key);
   convPool.set(key, { cid, ts: Date.now() });
   while (convPool.size > 100) convPool.delete(convPool.keys().next().value);
@@ -338,7 +349,7 @@ async function handleChat(req, res, body) {
   const model = resolveModel(body.model);
   const hasTools = TOOLS_ENABLED && Array.isArray(body.tools) && body.tools.length > 0;
   const noClarify = /^on|1|true|yes$/i.test(process.env.YUANBAO_NO_CLARIFY || '');
-  const reuse = takeConversation(body.messages);
+  const reuse = takeConversation(body.messages, body.user);
   let prompt = reuse.reused
     ? lastUserContent(body.messages)                       // 复用会话：只发最新一条（历史在元宝侧）
     : messagesToPrompt(body.messages || []);               // 新会话：全量拼接
@@ -351,7 +362,6 @@ async function handleChat(req, res, body) {
   const created = Math.floor(Date.now() / 1000);
 
   const cid = reuse.reused ? reuse.cid : await createConversation();
-  if (!reuse.reused) saveConversation(body.messages, cid);
   // 搜索模式走深度研究技能（协议级 applicationIdList，浏览器抓包实证），仅首轮注入
   const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, '', [],
     model.search && !reuse.reused ? ['application_id_deep_research'] : undefined);
@@ -361,6 +371,7 @@ async function handleChat(req, res, body) {
     // 深度研究反问：把问卷透传给客户端（回复下一轮消息即继续研究）
     if (clarifies.length) {
       const quiz = formatClarifies(clarifies);
+      saveConversation(body.messages, body.user, cid, { role: 'assistant', content: quiz });
       return json(res, 200, {
         id, object: 'chat.completion', created, model: body.model,
         choices: [{
@@ -373,6 +384,7 @@ async function handleChat(req, res, body) {
     }
     const tc = extractToolCall(text);
     if (tc) {
+      saveConversation(body.messages, body.user, cid, { role: 'assistant', content: null, tool_calls: [{ type: 'function', function: tc }] });
       return json(res, 200, {
         id, object: 'chat.completion', created, model: body.model,
         choices: [{
@@ -390,6 +402,7 @@ async function handleChat(req, res, body) {
     if (model.search && citations.length) {
       content += '\n\n参考链接：\n' + citations.slice(0, 8).map((c, i) => `${i + 1}. [${c.title}](${c.url})`).join('\n');
     }
+    saveConversation(body.messages, body.user, cid, { role: 'assistant', content });
     return json(res, 200, {
       id, object: 'chat.completion', created, model: body.model,
       choices: [{
@@ -409,6 +422,12 @@ async function handleChat(req, res, body) {
     id, object: 'chat.completion.chunk', created, model: body.model,
     choices: [{ index: 0, delta, finish_reason: finish }],
   }) + '\n\n');
+  let contentAcc = ''; // 流式内容累计（存会话锚用）
+  const emit = delta => {
+    if (typeof delta.content === 'string') contentAcc += delta.content;
+    if (delta.tool_calls) contentAcc += JSON.stringify(delta.tool_calls.map(t => t.function?.name));
+    sendChunk(delta);
+  };
   const finishStream = (finish, usage) => {
     res.write('data: ' + JSON.stringify({
       id, object: 'chat.completion.chunk', created, model: body.model,
@@ -424,20 +443,23 @@ async function handleChat(req, res, body) {
     const { text, usage } = await readSse(upstream);
     const tc = extractToolCall(text);
     if (tc) {
-      sendChunk({ tool_calls: [{ index: 0, id: newCallId(), type: 'function', function: tc }] });
+      emit({ tool_calls: [{ index: 0, id: newCallId(), type: 'function', function: tc }] });
+      saveConversation(body.messages, body.user, cid, { role: 'assistant', content: null, tool_calls: [{ type: 'function', function: tc }] });
       return finishStream('tool_calls', usage);
     }
-    if (text) sendChunk({ content: text });
+    if (text) emit({ content: text });
+    saveConversation(body.messages, body.user, cid, { role: 'assistant', content: text });
     return finishStream('stop', usage);
   }
   const { usage, citations, clarifies } = await readSse(upstream, (kind, piece) => {
-    if (kind === 'content') sendChunk({ content: piece });
+    if (kind === 'content') emit({ content: piece });
     if (kind === 'reasoning') sendChunk({ reasoning_content: piece });
   });
-  if (clarifies.length) sendChunk({ content: formatClarifies(clarifies) });
+  if (clarifies.length) emit({ content: formatClarifies(clarifies) });
   if (model.search && citations.length) {
-    sendChunk({ content: '\n\n参考链接：\n' + citations.slice(0, 8).map((c, i) => `${i + 1}. [${c.title}](${c.url})`).join('\n') });
+    emit({ content: '\n\n参考链接：\n' + citations.slice(0, 8).map((c, i) => `${i + 1}. [${c.title}](${c.url})`).join('\n') });
   }
+  saveConversation(body.messages, body.user, cid, { role: 'assistant', content: contentAcc });
   finishStream('stop', usage);
 }
 
