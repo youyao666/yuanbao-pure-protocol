@@ -633,6 +633,65 @@ async function handleImageEditOp(req, res, fields, files) {
   return json(res, 502, { error: { message: '未解析到结果图（上游形态未知，尾事件透传）', upstream_tail: tail } });
 }
 
+// 文件扩展名 → 元宝资源类型（源码模块 8879/10854 映射表）
+const DOC_TYPE = ext => {
+  const e = String(ext || '').toLowerCase().replace(/^\./, '');
+  if (e === 'pdf') return 'pdf';
+  if (['doc', 'docx'].includes(e)) return 'doc';
+  if (['ppt', 'pptx'].includes(e)) return 'ppt';
+  if (['xls', 'xlsx', 'csv'].includes(e)) return 'excel';
+  if (e === 'txt') return 'txt';
+  if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'].includes(e)) return 'image';
+  if (['c', 'cpp', 'js', 'ts', 'py', 'java', 'bat', 'sh', 'json', 'md', 'html', 'css'].includes(e)) return 'code';
+  return 'file';
+};
+const EXT_CONTENT_TYPE = ext => {
+  const e = String(ext || '').toLowerCase().replace(/^\./, '');
+  return { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', txt: 'text/plain' }[e] || 'application/octet-stream';
+};
+
+// 通用文件上传（图片走 uploadImage，文档走这里）→ multimedia 引用
+async function uploadDoc(buf, fileName) {
+  const kind = DOC_TYPE(require('path').extname(fileName));
+  const r1 = await fetch(`${BASE}/api/resource/genUploadInfo`, {
+    method: 'POST', headers: baseHeaders(),
+    body: JSON.stringify({ fileName, docFrom: 'localDoc', docOpenId: '', needAuth: true }),
+  });
+  const info = await r1.json();
+  if (!info.cosURL) throw new Error('genUploadInfo 失败: ' + JSON.stringify(info).slice(0, 150));
+  const putRes = await fetch(info.cosURL, {
+    method: 'PUT', headers: { authorization: info.putAuthorization, 'content-type': EXT_CONTENT_TYPE(require('path').extname(fileName)) }, body: buf,
+  });
+  if (!putRes.ok) throw new Error('COS PUT HTTP ' + putRes.status);
+  await fetch(`${BASE}/api/resource/asyncFileParse`, {
+    method: 'POST', headers: baseHeaders(),
+    body: JSON.stringify({ resourceList: [{ resourceUrl: info.resourceUrl, type: kind, size: buf.length, purpose: 'doc_reparse' }] }),
+  });
+  return {
+    type: kind, docType: kind, url: info.resourceUrl, signUrl: '',
+    fileName, size: buf.length, width: 0, height: 0,
+    fileId: randHex(15), uploadStatus: 'success', progress: 100,
+  };
+}
+
+// multipart 一条龙：上传文档 + 问答（/v1/files/chat）
+async function handleDocChat(req, res, fields, files) {
+  const docFile = files.file || files.image || files.document;
+  const prompt = fields.prompt || '请总结这个文件的内容';
+  if (!docFile) return json(res, 400, { error: { message: 'file(multipart) required' } });
+  const mm = await uploadDoc(docFile.data, docFile.filename || 'file.txt');
+  const model = resolveModel(fields.model || 'hy4');
+  const cid = await createConversation();
+  const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, '', [mm]);
+  const { text, think, usage } = await readSse(upstream);
+  const id = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
+  json(res, 200, {
+    id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: fields.model || 'hy4',
+    choices: [{ index: 0, message: { role: 'assistant', content: text, ...(think ? { reasoning_content: think } : {}) }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
+  });
+}
+
 // ---------------- 基础设施 ----------------
 function readBody(req) {
   return new Promise((ok, bad) => {
@@ -721,6 +780,13 @@ const server = http.createServer(async (req, res) => {
       if (!ct.includes('multipart')) return json(res, 400, { error: { message: 'multipart/form-data required' } });
       const { fields, files } = parseMultipart(raw, ct);
       return await handleImageEditOp(req, res, fields, files);
+    }
+    if (req.method === 'POST' && req.url === '/v1/files/chat') {
+      const raw = await readBody(req);
+      const ct = req.headers['content-type'] || '';
+      if (!ct.includes('multipart')) return json(res, 400, { error: { message: 'multipart/form-data required' } });
+      const { fields, files } = parseMultipart(raw, ct);
+      return await handleDocChat(req, res, fields, files);
     }
     json(res, 404, { error: { message: 'not found: ' + req.url } });
   } catch (e) {

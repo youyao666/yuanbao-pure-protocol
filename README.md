@@ -71,6 +71,7 @@ node yuanbao-server.js                          # 默认 http://127.0.0.1:8788/v
 #         POST /v1/images/generations（文生图，同步；size 可指定画幅 16:9/9:16/4:3/3:4
 #               或 OpenAI 风格 1792x1024 等）
 #         POST /v1/images/async + GET /v1/images/async/{id}（异步生图：提交即返回、轮询取图）
+#         POST /v1/files/chat（multipart：file + prompt，文档上传→解析→问答一条龙）
 #         POST /v1/images/edits（图生图，标准 multipart） | GET /healthz
 #   模型: 任一模型名加 -search 后缀 = 强制联网搜索模式（回答末尾附参考链接），
 #         如 hy4-search / deepseek-search
@@ -111,6 +112,7 @@ SSE 响应:
 - **异步生图任务表是内存态**：服务重启即清空，未做持久化。
 - **搜索模式已升级为协议级**：`-search` 后缀走"深度研究"技能（`applicationIdList: ["application_id_deep_research"]`，浏览器抓包实证）。深度研究 agent 可能先反问确认——**问卷会透传给客户端**（结构化 Markdown，含选项与推荐项），客户端把回答作为下一轮消息发来即在同一会话继续研究直至出报告。`YUANBAO_NO_CLARIFY=on` 可恢复"不提问直接答"模式。引用来自 SSE `searchGuid.docs`。
 - **会话粘性池的键设计**：`user` 字段（多人 gateway 的租户隔离，OpenAI 标准参数）+ messages 前缀指纹（去掉最后一条消息的全量 hash，含 assistant 回复与 tool_calls 序列化）。首轮历史为空不查池（必新建）；响应完成后以"历史 + 本轮回复"为下一轮存锚；复用时只发最新一条消息，历史由元宝服务端记忆（LRU 100 / TTL 30 分钟）。实测同 user 多轮上下文延续、异 user 不串。残余限制：同 user 且整段历史逐字相同的两条独立对话仍会互粘——这是无状态请求协议的本质极限，多人共用请务必传 `user`。
+- **文档对话已打通**（`/v1/files/chat`，multipart：file + prompt）：上传→COS→asyncFileParse→chat 引用，实测 txt 内容精确读取（连续三问三中）。关键坑：资源 `type` 必须按扩展名映射（txt→`txt`、pdf→`pdf`、doc/docx→`doc`、xls/xlsx/csv→`excel`、代码→`code`，源自码模块 8879/10854），填 `doc` 或 `file` 模型都读不到。
 - **图片编辑五件套（协议已验证，待上游恢复）**：`POST /api/image/{clarity|style|outpainting|elimination|removewatermark}`，body `{imageUrl, initOperateType(1清晰度/2去水印/3风格/4扩图/5消除), isReset}`，无需 QIMEI 签名，响应 SSE（`step`→`progress` 0~0.99→结果/错误）。实测 removewatermark 协议全通（进度流正常走完），但上游修图微服务（内部 `:8001/openapi/v1/images/retouch/watermark_removals`，30s 超时，多 IP 负载均衡）当日持续超时，待恢复即可接入。
 - **技能 applicationId 激活规律**：`deep_research` 经 `applicationIdList` 可激活专属 agent（已集成 `-search`）；`ai_coding` 等技能型 ID 在普通 chat 入口不响应（`applicationIdList`/`skillId` 双形态实测均维持 `main_agent_hy_for_pc`），需技能广场（skill market）配套上下文才能激活。全量 ID 清单（源码枚举）：`deep_research`、`web_search`、`knowledge_search`、`ai_coding`、`ai_reading`、`ai_answering`、`ai_writing`、`ai_image`、`ppt_generation`、`data_analysis`、`investment_analysis`、`professional_writing`、`personal_plan`、`teaching_assistant`、`voice_recorder`、`working_agent`。
 - **视频生成（灰度中）**：`GET /api/user/agent/ai_video/get_user_limits` 纯协议可查（实测日配额 5 次）；`text2video/image2video`（generationType=3）、AIGC 创作页（`/chat/ai-creation`）配置端点族齐全，但当前账号 `get-tab-list` 返回空（未下发模板）。待 tab 非空后在创作页抓包 `directGenerate` 即可复刻。
