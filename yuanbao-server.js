@@ -692,6 +692,24 @@ async function handleDocChat(req, res, fields, files) {
   });
 }
 
+// 图片理解：/v1/vision（multipart: image + prompt）→ 带图 + plugin:'Adaptive' 走理解分支纯文字输出
+async function handleVision(req, res, fields, files) {
+  const imageFile = files.image || files.file;
+  const prompt = fields.prompt || '请详细描述这张图片的内容';
+  if (!imageFile) return json(res, 400, { error: { message: 'image(multipart) required' } });
+  const mm = await uploadImage(imageFile.data, imageFile.filename || 'image.png');
+  const model = resolveModel(fields.model || 'hy4');
+  const cid = await createConversation();
+  const upstream = await yuanbaoChat(cid, prompt, model.chatModelId, 'Adaptive', [mm]);
+  const { text, think, usage } = await readSse(upstream);
+  const id = 'chatcmpl-' + crypto.randomBytes(12).toString('hex');
+  json(res, 200, {
+    id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: fields.model || 'hy4',
+    choices: [{ index: 0, message: { role: 'assistant', content: text, ...(think ? { reasoning_content: think } : {}) }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: usage.prompt || 0, completion_tokens: usage.completion || 0, total_tokens: usage.total || 0 },
+  });
+}
+
 // ---------------- 基础设施 ----------------
 function readBody(req) {
   return new Promise((ok, bad) => {
@@ -787,6 +805,13 @@ const server = http.createServer(async (req, res) => {
       if (!ct.includes('multipart')) return json(res, 400, { error: { message: 'multipart/form-data required' } });
       const { fields, files } = parseMultipart(raw, ct);
       return await handleDocChat(req, res, fields, files);
+    }
+    if (req.method === 'POST' && req.url === '/v1/vision') {
+      const raw = await readBody(req);
+      const ct = req.headers['content-type'] || '';
+      if (!ct.includes('multipart')) return json(res, 400, { error: { message: 'multipart/form-data required' } });
+      const { fields, files } = parseMultipart(raw, ct);
+      return await handleVision(req, res, fields, files);
     }
     json(res, 404, { error: { message: 'not found: ' + req.url } });
   } catch (e) {
