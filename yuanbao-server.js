@@ -761,7 +761,7 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end();
     }
-    if (API_KEY && req.url.startsWith('/v1/')) {
+    if (API_KEY && req.url.startsWith('/v1/') && req.url !== '/v1/healthz') {
       const auth = req.headers.authorization || '';
       if (auth !== `Bearer ${API_KEY}`) return json(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } });
     }
