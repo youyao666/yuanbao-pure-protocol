@@ -15,6 +15,7 @@ const CHROME_CANDIDATES = [
 ];
 const START_URL = 'https://yuanbao.tencent.com/chat/naQivTmsDa';
 const TIMEOUT_MS = 5 * 60 * 1000;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 function log(msg) { console.log('[login] ' + msg); }
 
@@ -102,8 +103,14 @@ async function main() {
     const deadline = Date.now() + (isAnon ? 90 * 1000 : TIMEOUT_MS);
     let hyUser = null, hyToken = null;
     let sawAnonymous = false;
+    // 语义验证式登录判定：不依赖 hy_user 格式（各登录渠道格式各异：微信32hex/QQ快登16hex）。
+    // 记录初始 hy_user（登录前为匿名 a_did_ 或空），值发生变化 + hy_token 存在时，
+    // 发真实 create 验证凭据有效性——通过才落盘，失败继续等。
+    const initialUser = { value: undefined };
+    let verifying = false;
     const prevCookies = new Map(); // cookie 名 -> 值哈希（观察登录瞬间的全量变化）
     while (Date.now() < deadline) {
+      if (verifying) { await sleep(300); continue; } // 语义验证进行中，勿并发
       try {
         const { cookies } = await conn.send('Storage.getCookies');
         // 打印 cookie 增量变化（只打名与是否变化，不打值）
@@ -119,6 +126,7 @@ async function main() {
         }
         const u = cookies.find(c => c.name === 'hy_user')?.value || null;
         const t = cookies.find(c => c.name === 'hy_token')?.value || null;
+        if (initialUser.value === undefined) initialUser.value = u;
         if (isAnon) {
           // 匿名模式：a_did_ 游客凭据出现即收工（免扫码，秒级）
           if (u && u.startsWith('a_did_') && t) { hyUser = u; hyToken = t; break; }
@@ -127,10 +135,32 @@ async function main() {
             sawAnonymous = true;
             log('当前是匿名态（a_did_），继续等待扫码登录…');
           }
-          // 登录成功判定：hy_user 非 a_did_ 匿名前缀即可。
-          // 实测多形态：微信扫码=32位hex；QQ快速登录=16位hex（配 pt_* 家族 cookie）。
-          // 只排除匿名，不限定 hex 长度。
-          if (u && !u.startsWith('a_did_') && t) { hyUser = u; hyToken = t; break; }
+          // 登录判定 = hy_user 相对初始值发生变化 + 有 token → 语义验证（create）
+          const changed = initialUser.value !== undefined && u && u !== initialUser.value;
+          if (changed && t) {
+            verifying = true;
+            log(`检测到 hy_user 变化（${initialUser.value?.slice(0, 8)}…→${u.slice(0, 8)}…），验证凭据…`);
+            (async () => {
+              try {
+                const vr = await fetch('https://yuanbao.tencent.com/api/user/agent/conversation/create', {
+                  method: 'POST',
+                  headers: { Cookie: `hy_source=web; hy_user=${u}; hy_token=${t}`, 'Content-Type': 'application/json', 'User-Agent': UA || 'Mozilla/5.0' },
+                  body: JSON.stringify({ agentId: 'naQivTmsDa' }),
+                });
+                const vb = await vr.json().catch(() => ({}));
+                verifying = false;
+                if (vr.status === 200 && vb?.id) {
+                  hyUser = u; hyToken = t;
+                  log('语义验证通过：凭据有效');
+                } else {
+                  log(`语义验证未过（HTTP ${vr.status}），继续等待…`);
+                }
+              } catch (e) {
+                verifying = false;
+                log('语义验证网络错误，继续等待…');
+              }
+            })();
+          }
         }
       } catch {}
       await sleep(1500);
@@ -140,7 +170,7 @@ async function main() {
       log('诊断：当前全部 cookie 名 → ' + [...prevCookies.keys()].join(', '));
     }
 
-    if (!hyUser || !hyToken) throw new Error(isAnon ? '超时：页面未签发匿名凭据（a_did_）' : '超时：未捕获到 hy_user/hy_token（5 分钟内未完成登录？）');
+    if (!hyUser || !hyToken) throw new Error(isAnon ? '超时：页面未签发匿名凭据（a_did_）' : '超时：未捕获到有效登录凭据（5 分钟内未完成登录？）');
 
     const cred = { hy_user: hyUser, hy_token: hyToken, agentId: 'naQivTmsDa' };
     const credPath = path.join(__dirname, isAnon ? 'yuanbao-anon-cookie.json' : 'yuanbao-cookie.json');
