@@ -127,8 +127,10 @@ async function main() {
             sawAnonymous = true;
             log('当前是匿名态（a_did_），继续等待扫码登录…');
           }
-          // 已实测验证：登录后 hy_user 变为 32 位 hex；匿名设备 ID 以 a_did_ 开头
-          if (u && /^[0-9a-f]{32}$/.test(u) && t) { hyUser = u; hyToken = t; break; }
+          // 登录成功判定：hy_user 非 a_did_ 匿名前缀即可。
+          // 实测多形态：微信扫码=32位hex；QQ快速登录=16位hex（配 pt_* 家族 cookie）。
+          // 只排除匿名，不限定 hex 长度。
+          if (u && !u.startsWith('a_did_') && t) { hyUser = u; hyToken = t; break; }
         }
       } catch {}
       await sleep(1500);
